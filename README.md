@@ -1,6 +1,6 @@
 # Multimodal Agent
 
-A hands-on learning project. Phase 1 is text chat using Next.js App Router, assistant-ui, and the official OpenAI SDK. No agent framework or Vercel AI SDK.
+A hands-on learning project. Phase 1 is text chat using Next.js App Router, assistant-ui, and the OpenAI Agents SDK. React Query manages client requests, Axios handles HTTP streaming, and Zod validates data. No Vercel AI SDK.
 
 ## Run locally
 
@@ -28,7 +28,11 @@ Open http://127.0.0.1:3000. The UI loads without a key; sending a message shows 
 
 Start at `src/components/assistant-ui/thread.tsx`. The UI composes assistant-ui's Thread, Message, Composer, Error, and ActionBar primitives; Tailwind handles the shell and plain CSS styles Markdown. No unsupported upload/tool buttons.
 
-`src/components/chat.tsx` creates `useLocalRuntime(modelAdapter)`. The runtime owns messages, loading/error state, new chats, and cancellation. There is no database or browser storage: refresh loses conversations.
+`src/components/chat.tsx` creates `useLocalRuntime(adapter)`. assistant-ui owns messages, generation state, new chats, and cancellation. Chat history is not persisted: refresh loses conversations.
+
+The component also creates a per-app React Query `QueryClient`. `useMutation` wraps the **entire streamed request**, not just receipt of HTTP headers. `src/lib/chat-api.ts` uses Axios's fetch adapter with `responseType: "stream"`; its XHR adapter would buffer rather than expose browser ReadableStreams. There are no direct frontend `fetch()` calls.
+
+Chat POSTs are mutations, not cached answers. Automatic retries are disabled to avoid replaying paid generations, and offline sends fail instead of being queued. No cacheable read endpoints exist yet; future metadata/source-list GET requests can use `useQuery` and cache invalidation. Do not confuse React Query's server-data cache with assistant-ui's conversation state.
 
 **Try:** send a message, copy a reply, start a new chat, and refresh.
 
@@ -36,28 +40,31 @@ Start at `src/components/assistant-ui/thread.tsx`. The UI composes assistant-ui'
 
 ```text
 page.tsx (server-rendered shell)
-  → Chat (client component + assistant-ui runtime)
+  → Chat (assistant-ui runtime + React Query mutation)
+  → Axios streaming request
   → POST /api/chat (HTTP route)
   → createChatResponse (service: chat policy)
-  → openChatStream (repository: OpenAI access)
+  → openChatStream (repository: Agent + Runner + OpenAIProvider)
   → OpenAI Responses API
 ```
 
 Read `src/components/chat.tsx`, then follow these three backend layers:
 
-| Layer      | File                                   | Owns                                                                                    |
-| ---------- | -------------------------------------- | --------------------------------------------------------------------------------------- |
-| API route  | `src/app/api/chat/route.ts`            | Origin check, HTTP input, status codes, NDJSON response, disconnect handling            |
-| Service    | `src/server/chat/chat.service.ts`      | Instructions, output budget, timeout, cancellation, safe mid-stream failures            |
-| Repository | `src/server/chat/openai.repository.ts` | Provider configuration, OpenAI SDK calls, provider error/event translation, SDK cleanup |
+| Layer      | File                                   | Owns                                                                           |
+| ---------- | -------------------------------------- | ------------------------------------------------------------------------------ |
+| API route  | `src/app/api/chat/route.ts`            | Origin check, HTTP input, status codes, NDJSON response, disconnect handling   |
+| Service    | `src/server/chat/chat.service.ts`      | Instructions, output budget, timeout, cancellation, safe mid-stream failures   |
+| Repository | `src/server/chat/openai.repository.ts` | Agents SDK execution, provider configuration, event/error translation, cleanup |
 
-`src/dto/chat.dto.ts` defines request/message/event/error DTOs and validates message shape and limits. **DTO is a contract, not a fourth execution layer.** TypeScript types alone do not validate JSON; `parseChatRequest` does that at runtime. `src/lib/chat-request.ts` handles HTTP content type, body byte limits, and JSON parsing before calling the DTO validator. `src/lib/api-error.ts` carries intentional public errors to the route; unexpected errors get a generic response.
+`src/dto/chat.dto.ts` defines Zod schemas and infers request/message/event/error DTOs from them. Schemas validate message shape, roles, limits, and streamed events; unknown request fields are stripped. `src/dto/source.dto.ts` also uses Zod for embedding validation. **DTO is a contract, not a fourth execution layer.** TypeScript types alone do not validate JSON; `parseChatRequest` does that at runtime. `src/lib/chat-request.ts` handles HTTP content type, body byte limits, and JSON parsing before calling the DTO validator. `src/lib/api-error.ts` carries intentional public errors to the route; unexpected errors get a generic response.
 
 The adapter converts UI content parts into `{ role, content }` text messages and sends the current conversation on every turn. This is context, not persistent memory. Empty assistant messages from failed/cancelled runs are omitted.
 
 Browser-supplied model settings are ignored. Only user/assistant text messages are accepted; clients cannot submit a system instruction. The service and repository are marked `server-only`, so importing them into a client component fails the Next.js build.
 
-There is no database yet: this repository is the external API access boundary, not conversation persistence. Layers use plain functions; no dependency-injection container, base classes, or unused repository interfaces.
+The OpenAI repository remains an external API access boundary, not conversation persistence. Supabase source/chunk persistence is a separate foundation described below. Layers use plain functions; no dependency-injection container, base classes, or unused repository interfaces.
+
+The repository builds one `Agent` and runs it through `Runner` with the OpenAI Responses provider. Its low-level OpenAI client only configures transport/retries; application code no longer calls `responses.create` directly. The service still supplies instructions and token budget. The run is capped at one turn with no tools/handoffs yet, and tracing is disabled so conversation data is not exported through tracing by default. `store: false` remains enabled.
 
 **Try:** lower `maxOutputTokens` in the service and request a long explanation. The repository should receive the new budget without any route/frontend edits.
 
@@ -73,11 +80,11 @@ OpenAI sends structured events, not one finished string. The repository translat
 {"type":"done"}
 ```
 
-Opening the provider stream is awaited before returning HTTP 200, so configuration/provider startup failures still get a proper error status. A later failure becomes an `error` record instead of a new HTTP status. `src/lib/chat-stream.ts` decodes records across arbitrary network/UTF-8 chunk boundaries and rejects a stream that ends without `done`.
+The Agents SDK starts work asynchronously. The repository waits for the first normalized text/completion event before returning the session, so configuration/provider startup failures still get a proper HTTP error status. A later failure becomes an `error` record instead of a new HTTP status. `src/lib/chat-stream.ts` decodes records across arbitrary network/UTF-8 chunk boundaries and rejects a stream that ends without `done`.
 
 The adapter accumulates deltas before yielding: assistant-ui replaces message content on each yield. Yielding only the newest delta would lose earlier text.
 
-Stop aborts the browser fetch; disconnect/cancellation aborts the upstream SDK request. The server also limits requests to 90 seconds. Cancelled requests may still incur charges for work already performed.
+Stop cancels the Axios request via AbortSignal; disconnect/cancellation aborts the upstream agent run. The repository awaits `result.completed` before emitting `done`—last text token alone does not establish successful completion. The server also limits requests to 90 seconds. Cancelled requests may still incur charges for work already performed.
 
 **Try:** request a long explanation, press Stop, then ask a follow-up. Watch the cancelled request in DevTools. Retry regenerates the response and makes another API call.
 
@@ -98,13 +105,27 @@ pnpm build   # Next.js production build
 pnpm start   # Serve production build on loopback
 ```
 
-`tests/chat.test.ts` checks DTO validation without HTTP, direct service/repository calls, actual byte limits, configuration errors, UTF-8 stream framing, conversation forwarding, safe provider errors, and cancellation using the real SDK with fake HTTP transport.
+`tests/chat.test.ts` checks Zod DTO validation, direct service/repository calls, byte limits, configuration errors, UTF-8 stream framing, history conversion, safe provider errors, and cancellation using the real Agents SDK with fake HTTP transport. `tests/chat-api.test.ts` checks Axios request arguments, streamed JSON errors, and incremental text handling.
 
-Real-model verification still requires your own key. No PDF handling, retrieval, tools, uploads, or persistence is implemented yet.
+Real-model verification still requires your own key. Chat is not yet connected to PDF processing or RAG.
+
+## Phase 2: Supabase foundation
+
+See [Supabase setup and learning guide](supabase/README.md) for the proposed schema, secret configuration, private bucket, migration commands, and checks. SQL/repositories are prepared locally; the migration has **not** been applied to your hosted database automatically.
+
+```bash
+pnpm test:sql      # Check migration/search/security using disposable local Postgres (Docker)
+pnpm test:supabase # Opt-in check against your configured Supabase DEV project; requires setup
+```
+
+No upload UI, PDF parsing/chunking, embedding generation, chat-history persistence, or chat-to-RAG wiring yet.
 
 ## References
 
 - [assistant-ui components](https://www.assistant-ui.com/components)
 - [LocalRuntime and ChatModelAdapter](https://www.assistant-ui.com/docs/runtimes/custom/local-runtime)
-- [OpenAI Node SDK](https://github.com/openai/openai-node)
+- [OpenAI Agents SDK streaming](https://openai.github.io/openai-agents-js/guides/streaming/)
+- [React Query mutations](https://tanstack.com/query/latest/docs/framework/react/guides/mutations)
+- [Axios](https://axios-http.com/)
+- [Zod](https://zod.dev/)
 - [Vite+ lint configuration](https://viteplus.dev/guide/lint)

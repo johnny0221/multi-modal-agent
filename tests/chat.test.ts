@@ -179,8 +179,8 @@ test("decoder surfaces mid-stream errors and unexpected EOF, not false success",
   }
 });
 
-// Real OpenAI SDK, fake HTTP transport: no API key or external requests needed.
-function mockOpenAI(events: unknown[], keepOpen = false) {
+// Real Agents SDK + OpenAI transport, realistic fake HTTP events; no paid calls.
+function mockOpenAI(events: { type: string; delta?: string }[], keepOpen = false) {
   vi.stubEnv("OPENAI_API_KEY", "test-secret-never-sent");
   let signal: AbortSignal | null | undefined;
   const fetchMock = vi.fn((_url: unknown, options?: RequestInit) => {
@@ -189,8 +189,31 @@ function mockOpenAI(events: unknown[], keepOpen = false) {
       new Response(
         new ReadableStream<Uint8Array>({
           start(controller) {
+            let text = "";
             for (const event of events) {
-              controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+              text += event.delta ?? "";
+              const payload =
+                event.type === "response.completed"
+                  ? {
+                      ...event,
+                      response: {
+                        id: "resp_test",
+                        object: "response",
+                        status: "completed",
+                        output: [
+                          {
+                            id: "msg_test",
+                            type: "message",
+                            role: "assistant",
+                            status: "completed",
+                            content: [{ type: "output_text", text, annotations: [] }],
+                          },
+                        ],
+                        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+                      },
+                    }
+                  : event;
+              controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(payload)}\n\n`));
             }
             if (!keepOpen) controller.close();
           },
@@ -225,12 +248,21 @@ test("route streams SDK deltas and completion, preserving history and server set
   const payload = JSON.parse(body);
   expect(payload).toMatchObject({
     model: "gpt-4.1-mini",
-    input: messages,
     store: false,
     stream: true,
     max_output_tokens: 2048,
   });
+  expect(
+    payload.input.map((message: { role: string; content: string | { text: string }[] }) => ({
+      role: message.role,
+      content:
+        typeof message.content === "string"
+          ? message.content
+          : message.content.map((part) => part.text).join("\n"),
+    })),
+  ).toEqual(messages);
   expect(payload.instructions).toContain("helpful assistant");
+  expect(fetchMock).toHaveBeenCalledTimes(1); // No tracing export or automatic model replay.
 });
 
 test("mid-stream provider failure reaches client as an error", async () => {

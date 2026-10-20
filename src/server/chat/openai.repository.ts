@@ -1,4 +1,12 @@
 import "server-only";
+import {
+  Agent,
+  OpenAIProvider,
+  Runner,
+  assistant,
+  user,
+  isOpenAIResponsesRawModelStreamEvent,
+} from "@openai/agents";
 import OpenAI from "openai";
 import type { ChatEventDto, ChatMessageDto } from "../../dto/chat.dto";
 import { ApiError } from "../../lib/api-error";
@@ -18,7 +26,7 @@ function providerError(error: unknown): ApiError {
   return new ApiError("OpenAI could not complete the response. Please retry.", 502);
 }
 
-// External API access only. No HTTP Request/Response or chat policy in this layer.
+// The Agents SDK owns model execution; the service supplies chat policy.
 export async function openChatStream(
   options: { messages: ChatMessageDto[]; instructions: string; maxOutputTokens: number },
   signal: AbortSignal,
@@ -32,45 +40,71 @@ export async function openChatStream(
     );
   }
 
+  // Configure transport only; no direct responses.create calls.
   const client = new OpenAI({ apiKey, maxRetries: 0 });
-  // Open eagerly: failures before streaming must still become an HTTP error status.
-  const upstream = await client.responses
-    .create(
-      {
-        model,
-        instructions: options.instructions,
-        input: options.messages,
-        max_output_tokens: options.maxOutputTokens,
-        store: false,
-        stream: true,
-      },
-      { signal },
-    )
-    .catch((error: unknown) => {
-      throw providerError(error);
+  const runner = new Runner({
+    modelProvider: new OpenAIProvider({ openAIClient: client, useResponses: true }),
+    tracingDisabled: true, // Do not export conversation data through SDK tracing by default.
+  });
+  const agent = new Agent({
+    name: "Multimodal Agent",
+    instructions: options.instructions,
+    model,
+    modelSettings: { maxTokens: options.maxOutputTokens, store: false, retry: { maxRetries: 0 } },
+  });
+  const cancellation = new AbortController();
+  try {
+    const input = options.messages.map((message) =>
+      message.role === "user" ? user(message.content) : assistant(message.content),
+    );
+    const result = await runner.run(agent, input, {
+      stream: true,
+      signal: AbortSignal.any([signal, cancellation.signal]),
+      maxTurns: 1, // Single agent turn until retrieval tools are explicitly introduced.
     });
 
-  async function* events(): AsyncGenerator<ChatEventDto, void> {
-    try {
-      for await (const event of upstream) {
-        if (
-          event.type === "response.output_text.delta" ||
-          event.type === "response.refusal.delta"
-        ) {
-          yield { type: "delta", text: event.delta };
-        } else if (event.type === "response.completed") {
-          yield { type: "done" };
-          return;
-        } else if (event.type === "response.incomplete") {
-          throw new Error("Incomplete model response");
-        } else if (event.type === "response.failed" || event.type === "error") {
-          throw new Error("Provider stream failed");
+    async function* events(): AsyncGenerator<ChatEventDto, void> {
+      let completed = false;
+      try {
+        for await (const event of result) {
+          if (event.type === "raw_model_stream_event" && event.data.type === "output_text_delta") {
+            yield { type: "delta", text: event.data.delta };
+          } else if (
+            event.type === "raw_model_stream_event" &&
+            event.data.type === "response_done"
+          ) {
+            completed = true;
+          } else if (
+            isOpenAIResponsesRawModelStreamEvent(event) &&
+            event.data.event.type === "response.refusal.delta"
+          ) {
+            yield { type: "delta", text: event.data.event.delta };
+          }
         }
+        // Text ending is not proof of successful agent completion.
+        await result.completed;
+        if (!completed || result.cancelled) throw new Error("Agent response did not complete");
+        yield { type: "done" };
+      } finally {
+        cancellation.abort();
+        await result.completed.catch(() => {});
       }
-      throw new Error("Provider stream ended early");
-    } finally {
-      upstream.controller.abort();
     }
+
+    const iterator = events();
+    // Agent runs start asynchronously. Prime the stream so startup failures still get HTTP errors.
+    const first = await iterator.next();
+    return (async function* (): AsyncGenerator<ChatEventDto, void> {
+      try {
+        if (!first.done) yield first.value;
+        yield* iterator;
+      } finally {
+        cancellation.abort();
+        await iterator.return();
+      }
+    })();
+  } catch (error) {
+    cancellation.abort();
+    throw providerError(error);
   }
-  return events();
 }

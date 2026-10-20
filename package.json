@@ -9,17 +9,24 @@
     "lint": "vp lint --deny-warnings",
     "format": "vp fmt",
     "check": "vp check",
-    "test": "vp test run"
+    "test": "vp test run",
+    "test:sql": "bash scripts/check-persistence.sh",
+    "test:supabase": "RUN_SUPABASE_CHECK=1 vp test run tests/supabase.integration.test.ts"
   },
   "dependencies": {
     "@assistant-ui/react": "^0.15.29",
     "@assistant-ui/react-markdown": "^0.14.23",
+    "@openai/agents": "^0.20.0",
+    "@supabase/supabase-js": "^2.118.0",
+    "@tanstack/react-query": "^5.104.4",
+    "axios": "^1.20.0",
     "next": "16.4.2",
     "openai": "^7.39.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "remark-gfm": "^4.0.1",
-    "server-only": "^0.0.1"
+    "server-only": "^0.0.1",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.3",

@@ -1,4 +1,4 @@
-import type { ChatEventDto } from "../dto/chat.dto";
+import { ChatEventSchema, type ChatEventDto } from "../dto/chat.dto";
 
 export function encodeChatEvent(event: ChatEventDto): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(event) + "\n");
@@ -19,17 +19,11 @@ export async function* readChatStream(body: ReadableStream<Uint8Array>): AsyncGe
         const line = pending.slice(0, newline);
         pending = pending.slice(newline + 1);
         if (!line.trim()) continue;
-        const event: unknown = JSON.parse(line);
-        if (typeof event !== "object" || event === null || !("type" in event)) {
-          throw new Error("Invalid chat stream.");
-        }
+        const result = ChatEventSchema.safeParse(JSON.parse(line));
+        if (!result.success) throw new Error("Invalid chat stream.");
+        const event = result.data;
         if (event.type === "done") return;
-        if (event.type === "error" && "message" in event && typeof event.message === "string") {
-          throw new Error(event.message);
-        }
-        if (event.type !== "delta" || !("text" in event) || typeof event.text !== "string") {
-          throw new Error("Invalid chat stream.");
-        }
+        if (event.type === "error") throw new Error(event.message);
         yield event.text;
       }
     }

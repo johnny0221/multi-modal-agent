@@ -1,52 +1,43 @@
+import { z } from "zod";
 import { ApiError } from "../lib/api-error";
-
-export type ChatMessageDto = {
-  role: "user" | "assistant";
-  content: string;
-};
-
-export type ChatRequestDto = { messages: ChatMessageDto[] };
-
-export type ChatEventDto =
-  | { type: "delta"; text: string }
-  | { type: "done" }
-  | { type: "error"; message: string };
-
-export type ChatErrorDto = { error: string };
 
 export const MAX_MESSAGES = 40;
 export const MAX_MESSAGE_CHARS = 16_000;
 
-// TypeScript types disappear at runtime. Validate untrusted JSON before using the DTO.
-export function parseChatRequest(body: unknown): ChatRequestDto {
-  if (typeof body !== "object" || body === null || !("messages" in body)) {
-    throw new ApiError("A messages array is required.");
-  }
-  const messages = body.messages;
-  if (!Array.isArray(messages) || messages.length < 1 || messages.length > MAX_MESSAGES) {
-    throw new ApiError(`Send between 1 and ${MAX_MESSAGES} messages. Start a new chat if needed.`);
-  }
+export const ChatMessageSchema = z.object({
+  role: z.enum(["user", "assistant"]),
+  content: z
+    .string()
+    .max(MAX_MESSAGE_CHARS)
+    .refine((text) => text.trim().length > 0, "Message text cannot be blank."),
+});
 
-  const validated = messages.map((message: unknown): ChatMessageDto => {
-    if (
-      typeof message !== "object" ||
-      message === null ||
-      !("role" in message) ||
-      (message.role !== "user" && message.role !== "assistant") ||
-      !("content" in message) ||
-      typeof message.content !== "string" ||
-      !message.content.trim() ||
-      message.content.length > MAX_MESSAGE_CHARS
-    ) {
-      throw new ApiError(
-        `Messages need a user/assistant role and 1–${MAX_MESSAGE_CHARS} characters of text.`,
-      );
-    }
-    // Copy only allowed fields. Clients cannot supply model settings or instructions.
-    return { role: message.role, content: message.content };
-  });
-  if (validated.at(-1)?.role !== "user") {
-    throw new ApiError("The last message must come from the user.");
-  }
-  return { messages: validated };
+// z.object strips unknown keys, including client-supplied model settings/instructions.
+export const ChatRequestSchema = z
+  .object({
+    messages: z.array(ChatMessageSchema).min(1).max(MAX_MESSAGES),
+  })
+  .refine(
+    (request) => request.messages.at(-1)?.role === "user",
+    "The last message must come from the user.",
+  );
+
+export const ChatEventSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("delta"), text: z.string() }),
+  z.object({ type: z.literal("done") }),
+  z.object({ type: z.literal("error"), message: z.string() }),
+]);
+
+export const ChatErrorSchema = z.object({ error: z.string() });
+
+export type ChatMessageDto = z.infer<typeof ChatMessageSchema>;
+export type ChatRequestDto = z.infer<typeof ChatRequestSchema>;
+export type ChatEventDto = z.infer<typeof ChatEventSchema>;
+export type ChatErrorDto = z.infer<typeof ChatErrorSchema>;
+
+export function parseChatRequest(body: unknown): ChatRequestDto {
+  const result = ChatRequestSchema.safeParse(body);
+  if (!result.success)
+    throw new ApiError(result.error.issues[0]?.message ?? "Invalid chat request.");
+  return result.data;
 }
