@@ -1,36 +1,110 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Multimodal Agent
 
-## Getting Started
+A hands-on learning project. Phase 1 is text chat using Next.js App Router, assistant-ui, and the official OpenAI SDK. No agent framework or Vercel AI SDK.
 
-First, run the development server:
+## Run locally
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+pnpm install
+# If .env does not exist yet:
+cp .env.example .env
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Fill in `OPENAI_API_KEY` in `.env`. `OPENAI_MODEL` starts as `gpt-4.1-mini`; change it to a Responses API model available to your OpenAI account. API access requires API billing/quota, separately from a ChatGPT subscription. Restart the server after editing environment variables.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+pnpm dev
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Open http://127.0.0.1:3000. The UI loads without a key; sending a message shows a configuration error until the key is supplied.
 
-## Learn More
+`.env` is gitignored. Only `.env.example` should be committed. Never prefix API keys with `NEXT_PUBLIC_`.
 
-To learn more about Next.js, take a look at the following resources:
+**Local prototype only:** dev/start bind to `127.0.0.1`. There is no authentication or per-user rate limiting. Do not expose this endpoint publicly until both are added, together with spending controls. Same-origin checking is not authentication.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Phase 1 learning checkpoints
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+### 1. UI and state
 
-## Deploy on Vercel
+Start at `src/components/assistant-ui/thread.tsx`. The UI composes assistant-ui's Thread, Message, Composer, Error, and ActionBar primitives; Tailwind handles the shell and plain CSS styles Markdown. No unsupported upload/tool buttons.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+`src/components/chat.tsx` creates `useLocalRuntime(modelAdapter)`. The runtime owns messages, loading/error state, new chats, and cancellation. There is no database or browser storage: refresh loses conversations.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+**Try:** send a message, copy a reply, start a new chat, and refresh.
+
+### 2. Browser/server boundary
+
+```text
+page.tsx (server-rendered shell)
+  → Chat (client component + assistant-ui runtime)
+  → POST /api/chat (HTTP route)
+  → createChatResponse (service: chat policy)
+  → openChatStream (repository: OpenAI access)
+  → OpenAI Responses API
+```
+
+Read `src/components/chat.tsx`, then follow these three backend layers:
+
+| Layer      | File                                   | Owns                                                                                    |
+| ---------- | -------------------------------------- | --------------------------------------------------------------------------------------- |
+| API route  | `src/app/api/chat/route.ts`            | Origin check, HTTP input, status codes, NDJSON response, disconnect handling            |
+| Service    | `src/server/chat/chat.service.ts`      | Instructions, output budget, timeout, cancellation, safe mid-stream failures            |
+| Repository | `src/server/chat/openai.repository.ts` | Provider configuration, OpenAI SDK calls, provider error/event translation, SDK cleanup |
+
+`src/dto/chat.dto.ts` defines request/message/event/error DTOs and validates message shape and limits. **DTO is a contract, not a fourth execution layer.** TypeScript types alone do not validate JSON; `parseChatRequest` does that at runtime. `src/lib/chat-request.ts` handles HTTP content type, body byte limits, and JSON parsing before calling the DTO validator. `src/lib/api-error.ts` carries intentional public errors to the route; unexpected errors get a generic response.
+
+The adapter converts UI content parts into `{ role, content }` text messages and sends the current conversation on every turn. This is context, not persistent memory. Empty assistant messages from failed/cancelled runs are omitted.
+
+Browser-supplied model settings are ignored. Only user/assistant text messages are accepted; clients cannot submit a system instruction. The service and repository are marked `server-only`, so importing them into a client component fails the Next.js build.
+
+There is no database yet: this repository is the external API access boundary, not conversation persistence. Layers use plain functions; no dependency-injection container, base classes, or unused repository interfaces.
+
+**Try:** lower `maxOutputTokens` in the service and request a long explanation. The repository should receive the new budget without any route/frontend edits.
+
+**Try:** say “My name is Ada,” then ask “What is my name?” Inspect the second request in browser DevTools: it includes the earlier user message and assistant answer, but never an API key.
+
+### 3. Streaming and cancellation
+
+OpenAI sends structured events, not one finished string. The repository translates provider events into `ChatEventDto` values, the service handles stream failures, and the route encodes newline-delimited JSON records:
+
+```json
+{"type":"delta","text":"Hello"}
+{"type":"delta","text":" world"}
+{"type":"done"}
+```
+
+Opening the provider stream is awaited before returning HTTP 200, so configuration/provider startup failures still get a proper error status. A later failure becomes an `error` record instead of a new HTTP status. `src/lib/chat-stream.ts` decodes records across arbitrary network/UTF-8 chunk boundaries and rejects a stream that ends without `done`.
+
+The adapter accumulates deltas before yielding: assistant-ui replaces message content on each yield. Yielding only the newest delta would lose earlier text.
+
+Stop aborts the browser fetch; disconnect/cancellation aborts the upstream SDK request. The server also limits requests to 90 seconds. Cancelled requests may still incur charges for work already performed.
+
+**Try:** request a long explanation, press Stop, then ask a follow-up. Watch the cancelled request in DevTools. Retry regenerates the response and makes another API call.
+
+### 4. Guardrails and checks
+
+- Request body: at most 128 KiB, enforced while reading (not just through Content-Length).
+- Conversation: 1–40 messages, at most 16,000 characters per message; ends with a user message.
+- Output: at most 2,048 tokens. Truncation is shown as an incomplete response, not success.
+- Missing key/model, rejected key, unavailable model, quota/rate limit, and interrupted streams produce visible errors without exposing raw provider errors.
+- No silent history truncation. Start a new chat when limits are reached.
+
+```bash
+pnpm lint    # Oxlint + type-aware checks; warnings fail
+pnpm format  # Oxfmt
+pnpm check   # Formatting, lint, types
+pnpm test    # Vite+ bundled test runner; no real OpenAI requests
+pnpm build   # Next.js production build
+pnpm start   # Serve production build on loopback
+```
+
+`tests/chat.test.ts` checks DTO validation without HTTP, direct service/repository calls, actual byte limits, configuration errors, UTF-8 stream framing, conversation forwarding, safe provider errors, and cancellation using the real SDK with fake HTTP transport.
+
+Real-model verification still requires your own key. No PDF handling, retrieval, tools, uploads, or persistence is implemented yet.
+
+## References
+
+- [assistant-ui components](https://www.assistant-ui.com/components)
+- [LocalRuntime and ChatModelAdapter](https://www.assistant-ui.com/docs/runtimes/custom/local-runtime)
+- [OpenAI Node SDK](https://github.com/openai/openai-node)
+- [Vite+ lint configuration](https://viteplus.dev/guide/lint)
